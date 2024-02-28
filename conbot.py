@@ -1,122 +1,93 @@
-import os
-
-import asyncio
 import discord
-from dotenv import load_dotenv
 from discord.ext import tasks, commands
-from argparse import Namespace
-import re
-import traceback
-from random import randint
+import subprocess
+from datetime import datetime, timedelta
+import asyncio
+from aiofiles import open as aio_open
+from aiofiles.os import stat as aio_stat
+import os
+from dotenv import load_dotenv
+import json
 
-from hotelcheck import ConHotel
-
+# Load environment variables
 load_dotenv()
-token = os.getenv('DISCORD_TOKEN')
-GUILD = os.getenv('DISCORD_GUILD')
-CHANNEL = os.getenv('DISCORD_CHANNEL')
-KEY1 = os.getenv('HOUSING_KEY1')
-KEY2 = os.getenv('HOUSING_KEY2')
-args = Namespace(alerts=None,
-                 budget=99999.0,
-                 checkin='2020-07-30',
-                 checkout='2020-08-02',
-                 children=0,
-                 guests=2,
-                 hotel_regex=re.compile('.*'),
-                 key=(KEY1, KEY2),
-                 max_distance=20,
-                 once=False,
-                 room_regex=re.compile('.*'),
-                 rooms=1,
-                 show_all=True,
-                 surname=None)
 
-client = discord.Client()
+# Accessing variables from .env file
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+SCRIPTS_CONFIG = os.getenv('SCRIPTS_CONFIG')
+
+# Load scripts configuration from a JSON file
+with open(SCRIPTS_CONFIG, 'r') as f:
+    scripts = json.load(f)
+
+bot = commands.Bot(command_prefix='!cb', intents=discord.Intents.default())
 
 
-@client.event
+async def get_file_size(file_path):
+    return (await aio_stat(file_path)).st_size
+
+
+async def tail(file_path, offset):
+    async with aio_open(file_path, 'r') as file:
+        await file.seek(offset)
+        return await file.read()
+
+
+async def run_script(script):
+    # Launch the process
+    process = subprocess.Popen([script['path']], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    # Wait for the process to start and allocate time for execution
+    await asyncio.sleep(1)  # Adjust based on expected execution time
+    process.terminate()
+
+    # Check for changes in the output file
+    new_size = await get_file_size(script['output_path'])
+    if new_size > script.get('last_size', 0):
+        changes = await tail(script['output_path'], script.get('last_size', 0))
+
+        # Iterate over all guilds the bot is a member of
+        for guild in bot.guilds:
+            # Iterate over all text channels in the guild
+            for channel in guild.text_channels:
+                try:
+                    await channel.send(f"```{changes}```")
+                except discord.Forbidden:
+                    print(f"Missing permissions to send messages in {channel.name} of {guild.name}")
+                except discord.HTTPException as e:
+                    print(f"Failed to send message in {channel.name} of {guild.name}: {e}")
+
+        script['last_size'] = new_size
+
+
+@tasks.loop(seconds=1)
+async def scheduler():
+    for script in scripts:
+        if datetime.now() >= script['next_run']:
+            await run_script(script)
+            script['next_run'] = datetime.now() + timedelta(seconds=script['interval'])
+
+
+@bot.event
 async def on_ready():
-    for guild in client.guilds:
-        if guild.name == GUILD:
-            break
-
-    ch = client.get_channel(int(CHANNEL))
-
-    print(
-        f'{client.user} is connected to the following guild:\n'
-        f'{guild.name}(id: {guild.id})'
-    )
-
-    await ch.send(
-        "I'm currently watching for new gencon hotels near the ICC\r\nSearching... (%d %s, %d %s, %s - %s, %s)" % (args.guests, 'guest' if args.guests == 1 else 'guests', args.rooms, 'room' if args.rooms == 1 else 'rooms', args.checkin, args.checkout,
-                                                                                                                   'connected' if args.max_distance == 'connected' else 'downtown' if args.max_distance is None else "within %.1f blocks" % args.max_distance))
-    activity = discord.Activity(name='Gen Con Hotels', type=discord.ActivityType.watching)
-    await client.change_presence(activity=activity)
+    print(f'Logged in as {bot.user.name}')
+    for script in scripts:
+        script['last_size'] = await get_file_size(script['output_path'])
+        script['next_run'] = datetime.now()  # Initialize next run time
+    scheduler.start()  # Start the scheduler task loop
 
 
-def diff(a, b):
-    a = [] if a is None else a
-    b = [] if b is None else b
-    return [item for item in a if item not in b]
+@bot.command()
+async def start(ctx):
+    """Starts the scheduler task."""
+    if not scheduler.is_running():
+        scheduler.start()
 
 
-class MyCog(commands.Cog):
-    def __init__(self, bot):
-        self.index = 0
-        self.bot = bot
-        self.channel = None
-        self.search = ConHotel(args)
-        self.lasthotels = None
-        self.printer.start()
-        self.alertlist = []
-
-    def cog_unload(self):
-        self.printer.cancel()
-
-    @tasks.loop(seconds=10.0)
-    async def printer(self):
-        self.index += 1
-        if self.index == 1:
-            await asyncio.sleep(3)
-        else:
-            await asyncio.sleep(randint(10, 50))
-        print("Search round: %s" % self.index)
-        try:
-            self.search.searchNew()
-            preamble, hotels = self.search.parseResults()
-            # first list the preamble and the additions
-            if preamble is not None:
-                text = "```diff\r\n"
-                text += "%s\r\n  %-15s %-10s %-80s %s\r\n" % (preamble, 'Distance', 'Price', 'Hotel', 'Room')
-                # check to see what was removed
-                removed = diff(self.lasthotels, hotels)
-                for hotel in removed:
-                    if len("%s%s" % (text, "-%-15s $%-10s %-80s %s\r\n" % (hotel['distance'], hotel['price'], hotel['name'], hotel['room']))) >= 1996:
-                        await self.channel.send("%s```" % text)
-                        text = "```diff\r\n"
-                    text += "-%-15s $%-10s %-80s %s\r\n" % (hotel['distance'], hotel['price'], hotel['name'], hotel['room'])
-                # check what was added
-                added = diff(hotels, self.lasthotels)
-                for hotel in added:
-                    if len("%s%s" % (text, "+%-15s $%-10s %-80s %s\r\n" % (hotel['distance'], hotel['price'], hotel['name'], hotel['room']))) >= 1996:
-                        await self.channel.send("%s```" % text)
-                        text = "```diff\r\n"
-                    text += "+%-15s $%-10s %-80s %s\r\n" % (hotel['distance'], hotel['price'], hotel['name'], hotel['room'])
-
-                if text != "```diff\r\n":
-                    await self.channel.send("%s```" % text)
-
-                self.lasthotels = hotels
-        except Exception as e:
-            print(traceback.format_exc())
-
-    @printer.before_loop
-    async def before_printer(self):
-        print('waiting to be ready...')
-        await self.bot.wait_until_ready()
-        self.channel = self.bot.get_channel(int(CHANNEL))
+@bot.command()
+async def stop(ctx):
+    """Stops the scheduler task."""
+    scheduler.stop()
 
 
-cog = MyCog(client)
-client.run(token)
+bot.run(DISCORD_TOKEN)
